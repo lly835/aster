@@ -1,0 +1,60 @@
+# "testnet" or "mainnet".
+environment = "testnet"
+
+# Normally leave these unset and use the environment defaults.
+# Some Aster testnet documentation has used more than one websocket hostname,
+# so both URLs remain explicitly overrideable.
+# rest_base_url = "https://fapi.asterdex-testnet.com"
+# ws_base_url = "wss://fstream.asterdex-testnet.com"
+
+# Use the exact API symbol returned by:
+# cargo run --release -- --config config.toml --list-symbols --symbol-filter USD1
+symbol = "BTCUSDT"
+
+# Decimal values are quoted deliberately to avoid floating-point configuration loss.
+quote_notional_usd = "10"
+max_position_notional_usd = "50"
+max_unrealized_loss_usd = "5"
+
+# Quote cadence and state polling.
+refresh_ms = 1000
+position_refresh_ms = 2000
+stats_interval_secs = 10
+stale_book_ms = 5000
+
+# 0 means quote at the current best bid/ask. Positive values move away from the touch.
+bid_offset_ticks = 0
+ask_offset_ticks = 0
+
+# At the maximum configured inventory, shift both quotes by this many ticks
+# to encourage inventory reduction.
+inventory_skew_ticks = 3
+
+# Do not cancel/replace unless price moves by at least this many ticks.
+requote_threshold_ticks = 1
+
+# Only orders beginning with this prefix are managed or cancelled by the bot.
+# Allowed: ASCII letters, digits, "_" and "-"; maximum 12 characters.
+client_order_prefix = "armm_"
+
+# Safe defaults. In dry-run mode no signed request is sent.
+dry_run = true
+
+# Live mode requires both:
+#   dry_run = false
+#   live_trading_ack = "I_UNDERSTAND_LIVE_TRADING"
+live_trading_ack = ""
+
+# Cancel bot-prefixed orders left by an earlier process before starting.
+startup_cancel_existing_bot_orders = true
+
+# Cancel bot-prefixed orders during normal shutdown or a detected error.
+# This does not close an existing position.
+cancel_on_exit = true
+
+# Optional Aster symbol-wide dead-man switch.
+# IMPORTANT: Aster's endpoint cancels ALL open orders on the configured symbol,
+# including manual orders and orders created by other software.
+deadman_switch_enabled = false
+deadman_countdown_ms = 120000
+deadman_heartbeat_ms = 30000
