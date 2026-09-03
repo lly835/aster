@@ -5,7 +5,7 @@ on:
     branches:
       - feat/rust-market-maker
     paths:
-      - scripts/apply_review_fixes.py
+      - scripts/final_review_patch.py
       - .github/workflows/apply-review-fixes.yml
 
 permissions:
@@ -23,7 +23,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Apply final reviewed changes
-        run: python3 scripts/apply_review_fixes.py
+        run: python3 scripts/final_review_patch.py
       - name: Refresh dependency lockfile
         run: cargo generate-lockfile
       - name: Format
@@ -39,7 +39,8 @@ jobs:
           git restore --source=HEAD -- \
             .github/workflows/ci.yml \
             .github/workflows/apply-review-fixes.yml \
-            scripts/apply_review_fixes.py
+            scripts/apply_review_fixes.py \
+            scripts/final_review_patch.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
