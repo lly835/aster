@@ -49,6 +49,14 @@ struct FileConfig {
     max_position_notional_usd: String,
     max_unrealized_loss_usd: String,
 
+    taker_rebalance_enabled: bool,
+    taker_rebalance_trigger_notional_usd: String,
+    taker_rebalance_target_notional_usd: String,
+    taker_rebalance_max_order_notional_usd: String,
+    taker_rebalance_max_position_age_secs: u64,
+    taker_rebalance_cooldown_secs: u64,
+    taker_rebalance_max_slippage_bps: u64,
+
     refresh_ms: u64,
     position_refresh_ms: u64,
     stats_interval_secs: u64,
@@ -81,6 +89,14 @@ impl Default for FileConfig {
             quote_notional_usd: "10".to_owned(),
             max_position_notional_usd: "50".to_owned(),
             max_unrealized_loss_usd: "5".to_owned(),
+
+            taker_rebalance_enabled: true,
+            taker_rebalance_trigger_notional_usd: "30".to_owned(),
+            taker_rebalance_target_notional_usd: "5".to_owned(),
+            taker_rebalance_max_order_notional_usd: "20".to_owned(),
+            taker_rebalance_max_position_age_secs: 180,
+            taker_rebalance_cooldown_secs: 30,
+            taker_rebalance_max_slippage_bps: 5,
 
             refresh_ms: 1_000,
             position_refresh_ms: 2_000,
@@ -115,6 +131,14 @@ pub struct RuntimeConfig {
     pub quote_notional_usd: Decimal,
     pub max_position_notional_usd: Decimal,
     pub max_unrealized_loss_usd: Decimal,
+
+    pub taker_rebalance_enabled: bool,
+    pub taker_rebalance_trigger_notional_usd: Decimal,
+    pub taker_rebalance_target_notional_usd: Decimal,
+    pub taker_rebalance_max_order_notional_usd: Decimal,
+    pub taker_rebalance_max_position_age_secs: u64,
+    pub taker_rebalance_cooldown_secs: u64,
+    pub taker_rebalance_max_slippage_bps: u64,
 
     pub refresh_ms: u64,
     pub position_refresh_ms: u64,
@@ -155,6 +179,18 @@ pub fn load(path: &Path) -> Result<RuntimeConfig> {
         parse_positive_decimal("max_position_notional_usd", &file.max_position_notional_usd)?;
     let max_unrealized_loss_usd =
         parse_positive_decimal("max_unrealized_loss_usd", &file.max_unrealized_loss_usd)?;
+    let taker_rebalance_trigger_notional_usd = parse_positive_decimal(
+        "taker_rebalance_trigger_notional_usd",
+        &file.taker_rebalance_trigger_notional_usd,
+    )?;
+    let taker_rebalance_target_notional_usd = parse_nonnegative_decimal(
+        "taker_rebalance_target_notional_usd",
+        &file.taker_rebalance_target_notional_usd,
+    )?;
+    let taker_rebalance_max_order_notional_usd = parse_positive_decimal(
+        "taker_rebalance_max_order_notional_usd",
+        &file.taker_rebalance_max_order_notional_usd,
+    )?;
 
     if file.symbol.trim().is_empty() {
         bail!("symbol cannot be empty");
@@ -176,6 +212,30 @@ pub fn load(path: &Path) -> Result<RuntimeConfig> {
     }
     if max_position_notional_usd < quote_notional_usd {
         bail!("max_position_notional_usd must be at least quote_notional_usd");
+    }
+    if file.taker_rebalance_enabled {
+        if taker_rebalance_target_notional_usd >= taker_rebalance_trigger_notional_usd {
+            bail!(
+                "taker_rebalance_target_notional_usd must be smaller than taker_rebalance_trigger_notional_usd"
+            );
+        }
+        if taker_rebalance_trigger_notional_usd > max_position_notional_usd {
+            bail!("taker_rebalance_trigger_notional_usd must not exceed max_position_notional_usd");
+        }
+        if taker_rebalance_max_order_notional_usd > max_position_notional_usd {
+            bail!(
+                "taker_rebalance_max_order_notional_usd must not exceed max_position_notional_usd"
+            );
+        }
+        if file.taker_rebalance_max_position_age_secs == 0 {
+            bail!("taker_rebalance_max_position_age_secs must be greater than zero");
+        }
+        if file.taker_rebalance_cooldown_secs == 0 {
+            bail!("taker_rebalance_cooldown_secs must be greater than zero");
+        }
+        if file.taker_rebalance_max_slippage_bps > 100 {
+            bail!("taker_rebalance_max_slippage_bps must not exceed 100 bps");
+        }
     }
 
     validate_client_order_prefix(&file.client_order_prefix)?;
@@ -231,6 +291,14 @@ pub fn load(path: &Path) -> Result<RuntimeConfig> {
         quote_notional_usd,
         max_position_notional_usd,
         max_unrealized_loss_usd,
+
+        taker_rebalance_enabled: file.taker_rebalance_enabled,
+        taker_rebalance_trigger_notional_usd,
+        taker_rebalance_target_notional_usd,
+        taker_rebalance_max_order_notional_usd,
+        taker_rebalance_max_position_age_secs: file.taker_rebalance_max_position_age_secs,
+        taker_rebalance_cooldown_secs: file.taker_rebalance_cooldown_secs,
+        taker_rebalance_max_slippage_bps: file.taker_rebalance_max_slippage_bps,
 
         refresh_ms: file.refresh_ms,
         position_refresh_ms: file.position_refresh_ms,
@@ -313,6 +381,15 @@ fn parse_positive_decimal(name: &str, value: &str) -> Result<Decimal> {
         Decimal::from_str(value).with_context(|| format!("{name} must be a decimal string"))?;
     if parsed <= Decimal::ZERO {
         bail!("{name} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn parse_nonnegative_decimal(name: &str, value: &str) -> Result<Decimal> {
+    let parsed =
+        Decimal::from_str(value).with_context(|| format!("{name} must be a decimal string"))?;
+    if parsed < Decimal::ZERO {
+        bail!("{name} must not be negative");
     }
     Ok(parsed)
 }

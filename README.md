@@ -2,7 +2,7 @@
 
 A conservative Rust market-making bot for the **Aster Futures API v3**.
 
-It maintains at most one post-only bid and one post-only ask for a single symbol, applies inventory-based quote skew, enforces a maximum position and unrealized-loss limit, and only manages orders carrying its configured client-order prefix.
+It maintains at most one post-only bid and one post-only ask for a single symbol, applies inventory-based quote skew, and can use a price-protected, reduce-only `LIMIT + IOC` order when inventory becomes too large or remains open too long. It enforces a maximum position and unrealized-loss limit and only manages orders carrying its configured client-order prefix.
 
 This project is for legitimate market making and execution research. It does **not** implement self-trading, multi-account matching, wash trading, or any mechanism intended to fabricate volume. Running the bot does not guarantee campaign eligibility or profit.
 
@@ -33,6 +33,7 @@ A risk-limit stop cancels the bot's orders but leaves any existing position open
 - one bid plus one ask, both `LIMIT + GTX`
 - self-trade prevention via `EXPIRE_BOTH`
 - inventory skew and per-side position-cap calculations
+- maker-first inventory reduction through configurable, reduce-only `LIMIT + IOC` orders
 - startup recovery by cancelling only bot-prefixed orders
 - partial-fill detection and replenishment
 - decoding of structured Aster API errors even when returned with HTTP 4xx
@@ -186,6 +187,14 @@ quote_notional_usd = "10"
 max_position_notional_usd = "50"
 max_unrealized_loss_usd = "5"
 
+taker_rebalance_enabled = true
+taker_rebalance_trigger_notional_usd = "30"
+taker_rebalance_target_notional_usd = "5"
+taker_rebalance_max_order_notional_usd = "20"
+taker_rebalance_max_position_age_secs = 180
+taker_rebalance_cooldown_secs = 30
+taker_rebalance_max_slippage_bps = 5
+
 refresh_ms = 1000
 position_refresh_ms = 2000
 stats_interval_secs = 10
@@ -230,6 +239,17 @@ sell = best ask + ask_offset_ticks
 
 As long inventory grows, both quotes move downward. As short inventory grows, both quotes move upward. The maximum shift is `inventory_skew_ticks` at the configured position cap.
 
+### Maker-first IOC inventory rebalancing
+
+When enabled, the normal path remains post-only Maker quoting. A Taker order is used only to reduce an existing net position when either:
+
+- absolute position notional reaches `taker_rebalance_trigger_notional_usd`; or
+- the position stays above `taker_rebalance_target_notional_usd` for `taker_rebalance_max_position_age_secs`.
+
+Before the aggressive order, the bot cancels its tracked Maker quotes and refreshes the position. It then submits one opposite-side `LIMIT + IOC` order with `reduceOnly=true`. The order quantity moves the position toward the configured target, is capped by `taker_rebalance_max_order_notional_usd`, and can never intentionally increase or reverse exposure. `taker_rebalance_max_slippage_bps` bounds the worst acceptable limit price, while `taker_rebalance_cooldown_secs` prevents repeated aggressive orders in a tight loop.
+
+This is inventory-risk control, not a target-volume or target-Maker/Taker-ratio engine. It may produce no Taker volume when inventory is naturally balanced, and it does not guarantee campaign points, the screenshot's 83.8%/16.2% split, or profitability.
+
 ### Requote threshold
 
 The bot keeps an existing order unless its target changes by at least `requote_threshold_ticks`, its desired quantity changes by at least one `stepSize`, it becomes partially filled, or it is no longer `NEW`.
@@ -267,7 +287,8 @@ This behavior prefers an interruption over accidentally creating duplicate expos
 - one-way position mode only
 - EVM API-wallet signing only
 - position and open-order reconciliation currently use REST polling; open orders are reconciled before the position snapshot used for replacement quotes
-- no automatic position liquidation or market close
+- no market orders; aggressive inventory reduction uses price-protected, reduce-only IOC limits
+- no automatic full liquidation after an unrealized-loss stop
 - no cross-exchange hedge
 - no profitability or airdrop-reward guarantee
 - user-trade statistics fetch at most ten 1,000-record pages per refresh

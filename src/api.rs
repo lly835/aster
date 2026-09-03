@@ -169,6 +169,8 @@ pub struct PlacedOrder {
     pub order_id: u64,
     pub client_order_id: String,
     pub status: String,
+    pub executed_qty: Decimal,
+    pub avg_price: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +405,40 @@ impl AsterClient {
             order_id: response.order_id,
             client_order_id: response.client_order_id,
             status: response.status,
+            executed_qty: parse_decimal("executedQty", &response.executed_qty)?,
+            avg_price: parse_decimal("avgPrice", &response.avg_price)?,
+        })
+    }
+
+    pub async fn place_reduce_only_ioc_limit(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        quantity: Decimal,
+        price: Decimal,
+        client_order_id: &str,
+    ) -> Result<PlacedOrder, AsterError> {
+        let mut params = BTreeMap::new();
+        params.insert("newClientOrderId".to_owned(), client_order_id.to_owned());
+        params.insert("newOrderRespType".to_owned(), "RESULT".to_owned());
+        params.insert("price".to_owned(), decimal_to_api(price));
+        params.insert("quantity".to_owned(), decimal_to_api(quantity));
+        params.insert("reduceOnly".to_owned(), "true".to_owned());
+        params.insert("side".to_owned(), side.as_str().to_owned());
+        params.insert("stpMode".to_owned(), "EXPIRE_BOTH".to_owned());
+        params.insert("symbol".to_owned(), symbol.to_owned());
+        params.insert("timeInForce".to_owned(), "IOC".to_owned());
+        params.insert("type".to_owned(), "LIMIT".to_owned());
+
+        let response: RawPlacedOrder = self
+            .signed_request(Method::POST, "/fapi/v3/order", params)
+            .await?;
+        Ok(PlacedOrder {
+            order_id: response.order_id,
+            client_order_id: response.client_order_id,
+            status: response.status,
+            executed_qty: parse_decimal("executedQty", &response.executed_qty)?,
+            avg_price: parse_decimal("avgPrice", &response.avg_price)?,
         })
     }
 
@@ -951,10 +987,18 @@ struct RawPlacedOrder {
     client_order_id: String,
     #[serde(default = "default_new_order_status")]
     status: String,
+    #[serde(rename = "executedQty", default = "default_zero_decimal_string")]
+    executed_qty: String,
+    #[serde(rename = "avgPrice", default = "default_zero_decimal_string")]
+    avg_price: String,
 }
 
 fn default_new_order_status() -> String {
     "NEW".to_owned()
+}
+
+fn default_zero_decimal_string() -> String {
+    "0".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
