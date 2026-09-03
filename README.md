@@ -43,7 +43,7 @@ A risk-limit stop cancels the bot's orders but leaves any existing position open
 
 ## Requirements
 
-- Rust 1.82 or newer
+- the current stable Rust toolchain
 - an Aster Pro API Wallet / Agent for signed requests
 - a system clock synchronized with NTP
 - an Aster account using **one-way position mode**
@@ -62,8 +62,8 @@ cp .env.example .env
 Build and test:
 
 ```bash
-cargo check --all-targets
-cargo test --all-targets
+cargo check --locked --all-targets
+cargo test --locked --all-targets
 ```
 
 ### 1. Dry run
@@ -266,7 +266,7 @@ This behavior prefers an interruption over accidentally creating duplicate expos
 - one symbol per process
 - one-way position mode only
 - EVM API-wallet signing only
-- position and open-order reconciliation currently use REST polling; position is refreshed after cancellation before replacement
+- position and open-order reconciliation currently use REST polling; open orders are reconciled before the position snapshot used for replacement quotes
 - no automatic position liquidation or market close
 - no cross-exchange hedge
 - no profitability or airdrop-reward guarantee

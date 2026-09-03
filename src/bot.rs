@@ -324,17 +324,8 @@ impl MarketMaker {
             .await
             .context("failed to refresh open orders")?;
 
-        self.position = self
-            .client
-            .position(&self.config.symbol, fallback_mark)
-            .await
-            .context("failed to refresh position")?;
-
-        let position_may_have_changed = self.reconcile_open_orders(open_orders).await?;
-        if position_may_have_changed {
-            self.refresh_position_only(fallback_mark).await?;
-        }
-        Ok(())
+        self.reconcile_open_orders(open_orders).await?;
+        self.refresh_position_only(fallback_mark).await
     }
 
     async fn refresh_position_only(&mut self, fallback_mark: Decimal) -> Result<()> {
@@ -647,6 +638,7 @@ impl MarketMaker {
             .await
         {
             Ok(placed) => {
+                let position_may_have_changed = placed.status != "NEW";
                 self.stats.managed_order_ids.insert(placed.order_id);
                 info!(
                     order_id = placed.order_id,
@@ -674,6 +666,9 @@ impl MarketMaker {
                             status: placed.status,
                         }),
                     );
+                }
+                if position_may_have_changed {
+                    self.refresh_position_only(target.price).await?;
                 }
                 Ok(())
             }
@@ -721,6 +716,8 @@ impl MarketMaker {
                 .await
             {
                 Ok(order) => {
+                    let position_may_have_changed =
+                        order.executed_qty > Decimal::ZERO || order.status != "NEW";
                     self.stats.managed_order_ids.insert(order.order_id);
                     info!(
                         attempt,
@@ -729,10 +726,13 @@ impl MarketMaker {
                         "recovered order after unknown execution response"
                     );
 
+                    self.stats.orders_placed = self.stats.orders_placed.saturating_add(1);
+                    self.stats.quoted_notional += target.price * target.quantity;
                     if order.status == "NEW" || order.status == "PARTIALLY_FILLED" {
-                        self.stats.orders_placed = self.stats.orders_placed.saturating_add(1);
-                        self.stats.quoted_notional += target.price * target.quantity;
                         self.set_current_order(side, Some(managed_from_open(order)));
+                    }
+                    if position_may_have_changed {
+                        self.refresh_position_only(target.price).await?;
                     }
                     return Ok(());
                 }
@@ -742,6 +742,10 @@ impl MarketMaker {
                         client_order_id = %client_order_id,
                         "order is not visible yet after unknown execution response"
                     );
+                }
+                Err(error) if error.is_rate_limited() => {
+                    warn!(attempt, %error, "rate limited while recovering order state");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(error) => {
                     return Err(error).context("failed while recovering unknown order state");
@@ -1081,6 +1085,13 @@ impl MarketMaker {
             }
         }
 
+        if !self.config.dry_run {
+            self.refresh_trade_stats().await;
+            let fallback_mark = self.position.mark_price;
+            if let Err(error) = self.refresh_position_only(fallback_mark).await {
+                warn!(%error, "failed to refresh final position statistics");
+            }
+        }
         self.log_stats(self.position.mark_price);
 
         if errors.is_empty() {

@@ -54,13 +54,17 @@ pub enum AsterError {
 
 impl AsterError {
     pub fn is_no_such_order(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Self::Api { code: -2013, .. } => true,
             Self::Api {
-                code: -2011 | -2013,
-                ..
+                code: -2011,
+                message,
+            } => {
+                let message = message.to_ascii_lowercase();
+                message.contains("unknown order") || message.contains("does not exist")
             }
-        )
+            _ => false,
+        }
     }
 
     pub fn is_transient_rejection(&self) -> bool {
@@ -1008,5 +1012,24 @@ mod tests {
             .expect("API error");
         assert!(matches!(error, AsterError::Api { code: -2013, .. }));
         assert!(api_error_from_value(&json!({"code": 200, "msg": "success"})).is_none());
+    }
+
+    #[test]
+    fn classifies_no_such_order_conservatively() {
+        assert!(AsterError::Api {
+            code: -2013,
+            message: "Order does not exist.".to_owned(),
+        }
+        .is_no_such_order());
+        assert!(AsterError::Api {
+            code: -2011,
+            message: "Unknown order sent.".to_owned(),
+        }
+        .is_no_such_order());
+        assert!(!AsterError::Api {
+            code: -2011,
+            message: "Cancellation rejected by risk controls.".to_owned(),
+        }
+        .is_no_such_order());
     }
 }
