@@ -45,7 +45,7 @@ jobs:
       - name: Generate dependency lockfile
         run: cargo generate-lockfile
       - name: Format
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all
       - name: Check
         run: cargo check --locked --all-targets
       - name: Clippy
