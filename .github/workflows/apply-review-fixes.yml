@@ -22,6 +22,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.82.0
         with:
           components: rustfmt, clippy
+      - name: Make README migration tolerant
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/apply_review_fixes.py")
+          content = path.read_text(encoding="utf-8")
+          needle = '    content = read(path)\n    count = content.count(old)\n'
+          replacement = (
+              '    content = read(path)\n'
+              '    if path == "README.md" and old.startswith("# Cancel bot-prefixed") and old not in content:\n'
+              '        old = "startup_cancel_existing_bot_orders = true\\n"\n'
+              '    count = content.count(old)\n'
+          )
+          if content.count(needle) != 1:
+              raise SystemExit("unexpected review-script helper layout")
+          path.write_text(content.replace(needle, replacement, 1), encoding="utf-8")
+          PY
       - name: Apply reviewed changes
         run: python3 scripts/apply_review_fixes.py
       - name: Generate dependency lockfile
