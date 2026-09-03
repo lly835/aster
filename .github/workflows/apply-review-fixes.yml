@@ -19,7 +19,7 @@ jobs:
         with:
           ref: feat/rust-market-maker
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: Make README migration tolerant
@@ -42,6 +42,21 @@ jobs:
           PY
       - name: Apply reviewed changes
         run: python3 scripts/apply_review_fixes.py
+      - name: Use current stable Rust policy
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path("Cargo.toml")
+          cargo = manifest.read_text(encoding="utf-8")
+          cargo = cargo.replace('rust-version = "1.82"\n', '', 1)
+          manifest.write_text(cargo, encoding="utf-8")
+
+          workflow = Path(".github/workflows/ci.yml")
+          ci = workflow.read_text(encoding="utf-8")
+          ci = ci.replace("dtolnay/rust-toolchain@1.82.0", "dtolnay/rust-toolchain@stable")
+          workflow.write_text(ci, encoding="utf-8")
+          PY
       - name: Generate dependency lockfile
         run: cargo generate-lockfile
       - name: Format
