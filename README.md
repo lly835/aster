@@ -35,8 +35,9 @@ A risk-limit stop cancels the bot's orders but leaves any existing position open
 - inventory skew and per-side position-cap calculations
 - startup recovery by cancelling only bot-prefixed orders
 - partial-fill detection and replenishment
-- explicit handling of HTTP 503 as an **unknown execution state**
-- session volume, maker/taker, commission and realized-PnL statistics
+- decoding of structured Aster API errors even when returned with HTTP 4xx
+- explicit recovery for HTTP 503 **unknown execution state** on placement and cancellation
+- session volume, maker/taker, commission and realized-PnL statistics restricted to orders placed by this process
 - optional Aster exchange dead-man switch
 - `--list-symbols`, `--check-auth`, and `--once` commands
 
@@ -54,8 +55,6 @@ Only EVM API-wallet signing is implemented in this version.
 ```bash
 git clone https://github.com/lly835/aster.git
 cd aster
-git checkout feat/rust-market-maker
-
 cp config.example.toml config.toml
 cp .env.example .env
 ```
@@ -202,6 +201,8 @@ client_order_prefix = "armm_"
 dry_run = true
 live_trading_ack = ""
 
+# Cancel bot-prefixed orders left by an earlier process before starting.
+# When false, startup fails instead of silently adopting or cancelling matching orders.
 startup_cancel_existing_bot_orders = true
 cancel_on_exit = true
 
@@ -256,14 +257,16 @@ For order placement, this bot:
 3. adopts the recovered order when found;
 4. halts when it cannot determine the result.
 
-This behavior prefers an interruption over accidentally creating duplicate exposure.
+For cancellation, it queries the order first and retries only when the order is still open. If shutdown cleanup cannot be confirmed, an enabled exchange dead-man switch is deliberately left armed.
+
+This behavior prefers an interruption over accidentally creating duplicate exposure or leaving an order live without protection.
 
 ## Operational limitations
 
 - one symbol per process
 - one-way position mode only
 - EVM API-wallet signing only
-- position and open-order reconciliation currently use REST polling
+- position and open-order reconciliation currently use REST polling; position is refreshed after cancellation before replacement
 - no automatic position liquidation or market close
 - no cross-exchange hedge
 - no profitability or airdrop-reward guarantee

@@ -170,6 +170,7 @@ pub struct PlacedOrder {
 #[derive(Debug, Clone)]
 pub struct TradeFill {
     pub id: u64,
+    pub order_id: u64,
     pub quote_qty: Decimal,
     pub commission: Decimal,
     pub realized_pnl: Decimal,
@@ -244,9 +245,7 @@ impl AsterClient {
 
     pub async fn sync_server_time(&self) -> Result<i64, AsterError> {
         let before = unix_millis_i64();
-        let response: TimeResponse = self
-            .unsigned_get("/fapi/v3/time", BTreeMap::new())
-            .await?;
+        let response: TimeResponse = self.unsigned_get("/fapi/v3/time", BTreeMap::new()).await?;
         let after = unix_millis_i64();
         let midpoint = before + ((after - before) / 2);
         let offset_ms = response.server_time - midpoint;
@@ -257,20 +256,14 @@ impl AsterClient {
         Ok(offset_ms)
     }
 
-    pub async fn fetch_symbol_rules(
-        &self,
-        symbol: &str,
-    ) -> Result<SymbolRules, AsterError> {
+    pub async fn fetch_symbol_rules(&self, symbol: &str) -> Result<SymbolRules, AsterError> {
         let value: Value = self
             .unsigned_get("/fapi/v3/exchangeInfo", BTreeMap::new())
             .await?;
         parse_symbol_rules(&value, symbol)
     }
 
-    pub async fn list_symbols(
-        &self,
-        filter: Option<&str>,
-    ) -> Result<Vec<String>, AsterError> {
+    pub async fn list_symbols(&self, filter: Option<&str>) -> Result<Vec<String>, AsterError> {
         let value: Value = self
             .unsigned_get("/fapi/v3/exchangeInfo", BTreeMap::new())
             .await?;
@@ -278,9 +271,7 @@ impl AsterClient {
             .get("symbols")
             .and_then(Value::as_array)
             .ok_or_else(|| {
-                AsterError::InvalidResponse(
-                    "exchangeInfo response is missing symbols".to_owned(),
-                )
+                AsterError::InvalidResponse("exchangeInfo response is missing symbols".to_owned())
             })?;
 
         let needle = filter.map(str::to_ascii_uppercase);
@@ -347,10 +338,9 @@ impl AsterClient {
 
         let quantity = parse_decimal("positionAmt", &position.position_amt)?;
         let entry_price = parse_decimal("entryPrice", &position.entry_price)?;
-        let mark_price = parse_decimal("markPrice", &position.mark_price)
-            .unwrap_or(fallback_mark_price);
-        let unrealized_pnl =
-            parse_decimal("unRealizedProfit", &position.unrealized_profit)?;
+        let mark_price =
+            parse_decimal("markPrice", &position.mark_price).unwrap_or(fallback_mark_price);
+        let unrealized_pnl = parse_decimal("unRealizedProfit", &position.unrealized_profit)?;
 
         Ok(PositionSnapshot {
             quantity,
@@ -392,10 +382,7 @@ impl AsterClient {
         client_order_id: &str,
     ) -> Result<PlacedOrder, AsterError> {
         let mut params = BTreeMap::new();
-        params.insert(
-            "newClientOrderId".to_owned(),
-            client_order_id.to_owned(),
-        );
+        params.insert("newClientOrderId".to_owned(), client_order_id.to_owned());
         params.insert("newOrderRespType".to_owned(), "ACK".to_owned());
         params.insert("price".to_owned(), decimal_to_api(price));
         params.insert("quantity".to_owned(), decimal_to_api(quantity));
@@ -481,7 +468,7 @@ impl AsterClient {
         }
 
         let response = self.inner.http.get(url).send().await?;
-        decode_response(response).await
+        decode_response(response, false).await
     }
 
     async fn signed_request<T>(
@@ -505,19 +492,16 @@ impl AsterClient {
             .ok_or(AsterError::MissingCredentials)?;
 
         params.insert("nonce".to_owned(), self.next_nonce().to_string());
-        params.insert(
-            "signer".to_owned(),
-            credentials.signer_address.clone(),
-        );
+        params.insert("signer".to_owned(), credentials.signer_address.clone());
         params.insert("user".to_owned(), credentials.user_address.clone());
 
         let sign_payload = encode_form(&params)?;
-        let signature = sign_payload_eip712(wallet, self.inner.chain_id, &sign_payload)
-            .await?;
+        let signature = sign_payload_eip712(wallet, self.inner.chain_id, &sign_payload).await?;
         params.insert("signature".to_owned(), signature);
         let final_payload = encode_form(&params)?;
 
         let url = format!("{}{}", self.inner.rest_base_url, path);
+        let execution_may_be_unknown = method != Method::GET;
         debug!(%method, %path, "sending signed Aster request");
 
         let request = if method == Method::GET {
@@ -528,24 +512,17 @@ impl AsterClient {
             self.inner
                 .http
                 .request(method, url)
-                .header(
-                    header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
-                )
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(final_payload)
         };
 
         let response = request.send().await?;
-        decode_response(response).await
+        decode_response(response, execution_may_be_unknown).await
     }
 
     fn next_nonce(&self) -> u64 {
-        let now = unix_micros_i128()
-            + i128::from(
-                self.inner
-                    .clock_offset_micros
-                    .load(Ordering::SeqCst),
-            );
+        let now =
+            unix_micros_i128() + i128::from(self.inner.clock_offset_micros.load(Ordering::SeqCst));
         let adjusted_now = now.max(0).min(i128::from(u64::MAX)) as u64;
 
         loop {
@@ -554,12 +531,7 @@ impl AsterClient {
             if self
                 .inner
                 .last_nonce
-                .compare_exchange(
-                    previous,
-                    candidate,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
+                .compare_exchange(previous, candidate, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
                 return candidate;
@@ -590,10 +562,8 @@ pub async fn run_book_ticker_stream(
                             match serde_json::from_str::<WsBookTicker>(text.as_ref()) {
                                 Ok(update) => {
                                     let parsed = (|| -> Result<Book, AsterError> {
-                                        let bid =
-                                            parse_decimal("b", &update.bid_price)?;
-                                        let ask =
-                                            parse_decimal("a", &update.ask_price)?;
+                                        let bid = parse_decimal("b", &update.bid_price)?;
+                                        let ask = parse_decimal("a", &update.ask_price)?;
                                         validate_book(bid, ask)?;
                                         Ok(Book {
                                             bid,
@@ -628,9 +598,7 @@ pub async fn run_book_ticker_stream(
                             warn!(?frame, "Aster websocket closed");
                             break;
                         }
-                        Ok(Message::Binary(_))
-                        | Ok(Message::Pong(_))
-                        | Ok(Message::Frame(_)) => {}
+                        Ok(Message::Binary(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
                         Err(error) => {
                             warn!(%error, "Aster websocket error");
                             break;
@@ -658,9 +626,7 @@ fn parse_symbol_rules(value: &Value, requested_symbol: &str) -> Result<SymbolRul
         .get("symbols")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            AsterError::InvalidResponse(
-                "exchangeInfo response is missing symbols".to_owned(),
-            )
+            AsterError::InvalidResponse("exchangeInfo response is missing symbols".to_owned())
         })?;
 
     let symbol = symbols
@@ -681,9 +647,7 @@ fn parse_symbol_rules(value: &Value, requested_symbol: &str) -> Result<SymbolRul
         .get("filters")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            AsterError::InvalidResponse(format!(
-                "symbol {requested_symbol} has no filters"
-            ))
+            AsterError::InvalidResponse(format!("symbol {requested_symbol} has no filters"))
         })?;
 
     let price_filter = find_filter(filters, "PRICE_FILTER")?;
@@ -703,11 +667,7 @@ fn parse_symbol_rules(value: &Value, requested_symbol: &str) -> Result<SymbolRul
     let min_qty = decimal_from_value(lot_filter, "minQty")?;
     let max_qty = decimal_from_value(lot_filter, "maxQty")?;
     let min_notional = min_notional_filter
-        .and_then(|filter| {
-            filter
-                .get("notional")
-                .or_else(|| filter.get("minNotional"))
-        })
+        .and_then(|filter| filter.get("notional").or_else(|| filter.get("minNotional")))
         .and_then(Value::as_str)
         .map(|value| parse_decimal("MIN_NOTIONAL", value))
         .transpose()?
@@ -736,10 +696,7 @@ fn parse_symbol_rules(value: &Value, requested_symbol: &str) -> Result<SymbolRul
     })
 }
 
-fn find_filter<'a>(
-    filters: &'a [Value],
-    filter_type: &str,
-) -> Result<&'a Value, AsterError> {
+fn find_filter<'a>(filters: &'a [Value], filter_type: &str) -> Result<&'a Value, AsterError> {
     filters
         .iter()
         .find(|filter| {
@@ -750,24 +707,21 @@ fn find_filter<'a>(
                 .unwrap_or(false)
         })
         .ok_or_else(|| {
-            AsterError::InvalidResponse(format!(
-                "exchangeInfo is missing {filter_type}"
-            ))
+            AsterError::InvalidResponse(format!("exchangeInfo is missing {filter_type}"))
         })
 }
 
 fn decimal_from_value(value: &Value, field: &str) -> Result<Decimal, AsterError> {
-    let raw = value.get(field).and_then(Value::as_str).ok_or_else(|| {
-        AsterError::InvalidResponse(format!("response is missing {field}"))
-    })?;
+    let raw = value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| AsterError::InvalidResponse(format!("response is missing {field}")))?;
     parse_decimal(field, raw)
 }
 
 fn parse_decimal(field: &str, raw: &str) -> Result<Decimal, AsterError> {
     Decimal::from_str(raw).map_err(|error| {
-        AsterError::InvalidResponse(format!(
-            "invalid decimal in {field}: {raw} ({error})"
-        ))
+        AsterError::InvalidResponse(format!("invalid decimal in {field}: {raw} ({error})"))
     })
 }
 
@@ -822,16 +776,32 @@ async fn sign_payload_eip712(
     Ok(signature.to_string())
 }
 
-async fn decode_response<T>(response: reqwest::Response) -> Result<T, AsterError>
+async fn decode_response<T>(
+    response: reqwest::Response,
+    execution_may_be_unknown: bool,
+) -> Result<T, AsterError>
 where
     T: DeserializeOwned,
 {
     let status = response.status();
     let body = response.text().await?;
 
-    if status.as_u16() == 503 {
+    if status.as_u16() == 503 && execution_may_be_unknown {
         return Err(AsterError::ExecutionUnknown(body));
     }
+
+    let parsed_value = if body.trim().is_empty() {
+        Ok(Value::Null)
+    } else {
+        serde_json::from_str::<Value>(&body)
+    };
+
+    if let Ok(value) = &parsed_value {
+        if let Some(error) = api_error_from_value(value) {
+            return Err(error);
+        }
+    }
+
     if !status.is_success() {
         return Err(AsterError::Http {
             status: status.as_u16(),
@@ -839,24 +809,21 @@ where
         });
     }
 
-    let value = if body.trim().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str::<Value>(&body)?
-    };
-
-    if let Some(code) = api_code(&value) {
-        if code < 0 {
-            let message = value
-                .get("msg")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown API error")
-                .to_owned();
-            return Err(AsterError::Api { code, message });
-        }
-    }
-
+    let value = parsed_value?;
     serde_json::from_value(value).map_err(AsterError::from)
+}
+
+fn api_error_from_value(value: &Value) -> Option<AsterError> {
+    let code = api_code(value)?;
+    if code >= 0 {
+        return None;
+    }
+    let message = value
+        .get("msg")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown API error")
+        .to_owned();
+    Some(AsterError::Api { code, message })
 }
 
 fn api_code(value: &Value) -> Option<i64> {
@@ -978,12 +945,19 @@ struct RawPlacedOrder {
     order_id: u64,
     #[serde(rename = "clientOrderId")]
     client_order_id: String,
+    #[serde(default = "default_new_order_status")]
     status: String,
+}
+
+fn default_new_order_status() -> String {
+    "NEW".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
 struct RawTradeFill {
     id: u64,
+    #[serde(rename = "orderId")]
+    order_id: u64,
     #[serde(rename = "quoteQty")]
     quote_qty: String,
     commission: String,
@@ -998,6 +972,7 @@ impl TryFrom<RawTradeFill> for TradeFill {
     fn try_from(value: RawTradeFill) -> Result<Self, Self::Error> {
         Ok(Self {
             id: value.id,
+            order_id: value.order_id,
             quote_qty: parse_decimal("quoteQty", &value.quote_qty)?,
             commission: parse_decimal("commission", &value.commission)?,
             realized_pnl: parse_decimal("realizedPnl", &value.realized_pnl)?,
@@ -1010,7 +985,9 @@ impl TryFrom<RawTradeFill> for TradeFill {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::encode_form;
+    use serde_json::json;
+
+    use super::{api_error_from_value, encode_form, AsterError};
 
     #[test]
     fn form_payload_is_ascii_key_sorted() {
@@ -1023,5 +1000,13 @@ mod tests {
             encode_form(&params).expect("encode"),
             "nonce=2&price=1.25&symbol=BTCUSDT"
         );
+    }
+
+    #[test]
+    fn recognizes_api_errors_independent_of_http_status() {
+        let error = api_error_from_value(&json!({"code": -2013, "msg": "Order does not exist."}))
+            .expect("API error");
+        assert!(matches!(error, AsterError::Api { code: -2013, .. }));
+        assert!(api_error_from_value(&json!({"code": 200, "msg": "success"})).is_none());
     }
 }

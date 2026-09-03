@@ -118,21 +118,11 @@ async fn main() -> Result<()> {
     let rules = client
         .fetch_symbol_rules(&config.symbol)
         .await
-        .with_context(|| {
-            format!(
-                "failed to load exchange filters for {}",
-                config.symbol
-            )
-        })?;
+        .with_context(|| format!("failed to load exchange filters for {}", config.symbol))?;
     let initial_book = client
         .book_ticker(&config.symbol)
         .await
-        .with_context(|| {
-            format!(
-                "failed to load initial book ticker for {}",
-                config.symbol
-            )
-        })?;
+        .with_context(|| format!("failed to load initial book ticker for {}", config.symbol))?;
 
     let (book_tx, book_rx) = watch::channel(Some(initial_book.clone()));
     let websocket_task = tokio::spawn(run_book_ticker_stream(
@@ -147,13 +137,7 @@ async fn main() -> Result<()> {
         "loaded initial Aster book ticker"
     );
 
-    let bot = MarketMaker::new(
-        client,
-        config,
-        rules,
-        book_rx,
-        &initial_book,
-    );
+    let bot = MarketMaker::new(client, config, rules, book_rx, &initial_book);
     let result = bot.run(cli.once).await;
 
     websocket_task.abort();
@@ -163,8 +147,7 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

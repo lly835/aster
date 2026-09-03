@@ -2,7 +2,6 @@
 name = "aster-rust-market-maker"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
 license = "MIT"
 description = "A conservative post-only market-making bot for Aster Futures API v3"
 
@@ -28,5 +27,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
 strip = true

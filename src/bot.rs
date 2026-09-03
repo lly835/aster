@@ -4,18 +4,14 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use rust_decimal::{
-    prelude::ToPrimitive,
-    Decimal,
-};
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+const SERVER_TIME_RESYNC_SECS: u64 = 300;
+
 use crate::{
-    api::{
-        AsterClient, AsterError, Book, OpenOrder, OrderSide, PositionSnapshot,
-        SymbolRules,
-    },
+    api::{AsterClient, AsterError, Book, OpenOrder, OrderSide, PositionSnapshot, SymbolRules},
     config::RuntimeConfig,
 };
 
@@ -49,6 +45,7 @@ struct SessionStats {
     taker_notional: Decimal,
     commission_abs: Decimal,
     realized_pnl: Decimal,
+    managed_order_ids: HashSet<u64>,
     seen_trade_ids: HashSet<u64>,
     last_trade_id: Option<u64>,
 }
@@ -67,6 +64,7 @@ impl SessionStats {
             taker_notional: Decimal::ZERO,
             commission_abs: Decimal::ZERO,
             realized_pnl: Decimal::ZERO,
+            managed_order_ids: HashSet::new(),
             seen_trade_ids: HashSet::new(),
             last_trade_id: None,
         }
@@ -133,14 +131,13 @@ impl MarketMaker {
         quote_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let now = Instant::now();
+        let mut last_clock_sync = now;
         let mut last_state_refresh = now
             .checked_sub(Duration::from_millis(self.config.position_refresh_ms))
             .unwrap_or(now);
         let mut last_stats_refresh = now;
         let mut last_deadman_heartbeat = now
-            .checked_sub(Duration::from_millis(
-                self.config.deadman_heartbeat_ms,
-            ))
+            .checked_sub(Duration::from_millis(self.config.deadman_heartbeat_ms))
             .unwrap_or(now);
         let mut shutdown_signal = Box::pin(tokio::signal::ctrl_c());
 
@@ -171,6 +168,17 @@ impl MarketMaker {
                         continue;
                     }
                     self.stale_orders_cancelled = false;
+
+                    if !self.config.dry_run
+                        && last_clock_sync.elapsed()
+                            >= Duration::from_secs(SERVER_TIME_RESYNC_SECS)
+                    {
+                        self.client
+                            .sync_server_time()
+                            .await
+                            .context("failed to resynchronize server time")?;
+                        last_clock_sync = Instant::now();
+                    }
 
                     let mid = (book.bid + book.ask) / Decimal::from(2_u32);
 
@@ -283,6 +291,8 @@ impl MarketMaker {
 
         if self.config.startup_cancel_existing_bot_orders {
             self.cancel_all_orders_with_prefix().await?;
+        } else {
+            self.ensure_no_existing_bot_orders().await?;
         }
 
         let current_book = self
@@ -290,8 +300,7 @@ impl MarketMaker {
             .borrow()
             .clone()
             .ok_or_else(|| anyhow!("no initial book is available"))?;
-        let mid =
-            (current_book.bid + current_book.ask) / Decimal::from(2_u32);
+        let mid = (current_book.bid + current_book.ask) / Decimal::from(2_u32);
         self.refresh_live_state(mid).await?;
 
         if self.config.deadman_switch_enabled {
@@ -300,10 +309,7 @@ impl MarketMaker {
                 "exchange dead-man switch is enabled; Aster will cancel ALL open orders for this symbol if heartbeats stop"
             );
             self.client
-                .countdown_cancel_all(
-                    &self.config.symbol,
-                    self.config.deadman_countdown_ms,
-                )
+                .countdown_cancel_all(&self.config.symbol, self.config.deadman_countdown_ms)
                 .await
                 .context("failed to arm exchange dead-man switch")?;
         }
@@ -312,24 +318,35 @@ impl MarketMaker {
     }
 
     async fn refresh_live_state(&mut self, fallback_mark: Decimal) -> Result<()> {
+        let open_orders = self
+            .client
+            .open_orders(&self.config.symbol)
+            .await
+            .context("failed to refresh open orders")?;
+
         self.position = self
             .client
             .position(&self.config.symbol, fallback_mark)
             .await
             .context("failed to refresh position")?;
 
-        let open_orders = self
-            .client
-            .open_orders(&self.config.symbol)
-            .await
-            .context("failed to refresh open orders")?;
-        self.reconcile_open_orders(open_orders).await
+        let position_may_have_changed = self.reconcile_open_orders(open_orders).await?;
+        if position_may_have_changed {
+            self.refresh_position_only(fallback_mark).await?;
+        }
+        Ok(())
     }
 
-    async fn reconcile_open_orders(
-        &mut self,
-        open_orders: Vec<OpenOrder>,
-    ) -> Result<()> {
+    async fn refresh_position_only(&mut self, fallback_mark: Decimal) -> Result<()> {
+        self.position = self
+            .client
+            .position(&self.config.symbol, fallback_mark)
+            .await
+            .context("failed to refresh position after order-state change")?;
+        Ok(())
+    }
+
+    async fn reconcile_open_orders(&mut self, open_orders: Vec<OpenOrder>) -> Result<bool> {
         let tracked_buy_id = self
             .buy_order
             .as_ref()
@@ -341,16 +358,14 @@ impl MarketMaker {
 
         let mut buy_seen = false;
         let mut sell_seen = false;
+        let mut position_may_have_changed = false;
         let mut cancel_ids = Vec::new();
 
-        for order in open_orders
-            .into_iter()
-            .filter(|order| {
-                order
-                    .client_order_id
-                    .starts_with(&self.config.client_order_prefix)
-            })
-        {
+        for order in open_orders.into_iter().filter(|order| {
+            order
+                .client_order_id
+                .starts_with(&self.config.client_order_prefix)
+        }) {
             let is_tracked_buy = tracked_buy_id
                 .as_ref()
                 .map(|id| id == &order.client_order_id)
@@ -370,6 +385,7 @@ impl MarketMaker {
                         executed_qty = %order.executed_qty,
                         "buy order was partially filled; cancelling remainder before replenishing"
                     );
+                    position_may_have_changed = true;
                     cancel_ids.push(order.client_order_id);
                     self.buy_order = None;
                 }
@@ -383,6 +399,7 @@ impl MarketMaker {
                         executed_qty = %order.executed_qty,
                         "sell order was partially filled; cancelling remainder before replenishing"
                     );
+                    position_may_have_changed = true;
                     cancel_ids.push(order.client_order_id);
                     self.sell_order = None;
                 }
@@ -392,28 +409,29 @@ impl MarketMaker {
                     client_order_id = %order.client_order_id,
                     "found an untracked bot-prefixed order; cancelling it"
                 );
+                position_may_have_changed = true;
                 cancel_ids.push(order.client_order_id);
             }
         }
 
         if tracked_buy_id.is_some() && !buy_seen {
             self.buy_order = None;
+            position_may_have_changed = true;
         }
         if tracked_sell_id.is_some() && !sell_seen {
             self.sell_order = None;
+            position_may_have_changed = true;
         }
 
         for client_order_id in cancel_ids {
             self.cancel_by_client_id(&client_order_id).await?;
         }
 
-        Ok(())
+        Ok(position_may_have_changed)
     }
 
     fn enforce_risk_limits(&self, mark_price: Decimal) -> Result<()> {
-        if self.position.unrealized_pnl
-            <= -self.config.max_unrealized_loss_usd
-        {
+        if self.position.unrealized_pnl <= -self.config.max_unrealized_loss_usd {
             bail!(
                 "unrealized loss limit reached: uPnL={} USD, configured limit=-{} USD; open position is left unchanged",
                 self.position.unrealized_pnl,
@@ -423,8 +441,7 @@ impl MarketMaker {
 
         let position_notional = self.position.quantity.abs() * mark_price;
         if position_notional
-            > self.config.max_position_notional_usd
-                + self.config.quote_notional_usd
+            > self.config.max_position_notional_usd + self.config.quote_notional_usd
         {
             warn!(
                 position_notional = %position_notional,
@@ -440,16 +457,63 @@ impl MarketMaker {
         self.stats.quote_cycles = self.stats.quote_cycles.saturating_add(1);
 
         let (buy_target, sell_target) = self.compute_targets(book)?;
-        self.manage_side(OrderSide::Buy, buy_target).await?;
-        self.manage_side(OrderSide::Sell, sell_target).await?;
+        let buy_cancelled = self
+            .cancel_side_if_needed(OrderSide::Buy, buy_target.as_ref())
+            .await?;
+        let sell_cancelled = self
+            .cancel_side_if_needed(OrderSide::Sell, sell_target.as_ref())
+            .await?;
+
+        if !self.config.dry_run && (buy_cancelled || sell_cancelled) {
+            let mid = (book.bid + book.ask) / Decimal::from(2_u32);
+            self.refresh_position_only(mid).await?;
+        }
+
+        let (buy_target, sell_target) = self.compute_targets(book)?;
+        self.place_missing_side(OrderSide::Buy, buy_target).await?;
+        self.place_missing_side(OrderSide::Sell, sell_target)
+            .await?;
 
         Ok(())
     }
 
-    fn compute_targets(
-        &self,
-        book: &Book,
-    ) -> Result<(Option<QuoteTarget>, Option<QuoteTarget>)> {
+    async fn cancel_side_if_needed(
+        &mut self,
+        side: OrderSide,
+        target: Option<&QuoteTarget>,
+    ) -> Result<bool> {
+        let should_cancel = match (self.current_order(side), target) {
+            (Some(_), None) => true,
+            (Some(existing), Some(target)) => self.needs_requote(existing, target),
+            (None, _) => false,
+        };
+
+        if !should_cancel {
+            return Ok(false);
+        }
+
+        let existing = self
+            .take_current_order(side)
+            .ok_or_else(|| anyhow!("managed order disappeared before cancellation"))?;
+        self.cancel_existing(&existing).await?;
+        Ok(true)
+    }
+
+    async fn place_missing_side(
+        &mut self,
+        side: OrderSide,
+        target: Option<QuoteTarget>,
+    ) -> Result<()> {
+        if self.current_order(side).is_some() {
+            return Ok(());
+        }
+        if let Some(target) = target {
+            self.place_target(side, target).await?;
+        }
+        Ok(())
+    }
+
+    fn compute_targets(&self, book: &Book) -> Result<(Option<QuoteTarget>, Option<QuoteTarget>)> {
         let mid = (book.bid + book.ask) / Decimal::from(2_u32);
         if mid <= Decimal::ZERO {
             bail!("cannot quote on a non-positive mid price");
@@ -457,25 +521,22 @@ impl MarketMaker {
 
         let signed_position_notional = self.position.quantity * mid;
         let absolute_position_notional = signed_position_notional.abs();
-        let mut inventory_ratio = absolute_position_notional
-            / self.config.max_position_notional_usd;
+        let mut inventory_ratio =
+            absolute_position_notional / self.config.max_position_notional_usd;
         if inventory_ratio > Decimal::ONE {
             inventory_ratio = Decimal::ONE;
         }
 
-        let skew_ticks = (inventory_ratio
-            * Decimal::from(self.config.inventory_skew_ticks))
-        .ceil()
-        .to_u64()
-        .unwrap_or(self.config.inventory_skew_ticks);
+        let skew_ticks = (inventory_ratio * Decimal::from(self.config.inventory_skew_ticks))
+            .ceil()
+            .to_u64()
+            .unwrap_or(self.config.inventory_skew_ticks);
         let skew = self.rules.tick_size * Decimal::from(skew_ticks);
 
-        let mut buy_price = book.bid
-            - self.rules.tick_size
-                * Decimal::from(self.config.bid_offset_ticks);
-        let mut sell_price = book.ask
-            + self.rules.tick_size
-                * Decimal::from(self.config.ask_offset_ticks);
+        let mut buy_price =
+            book.bid - self.rules.tick_size * Decimal::from(self.config.bid_offset_ticks);
+        let mut sell_price =
+            book.ask + self.rules.tick_size * Decimal::from(self.config.ask_offset_ticks);
 
         if self.position.quantity > Decimal::ZERO {
             buy_price -= skew;
@@ -489,16 +550,10 @@ impl MarketMaker {
         sell_price = ceil_to_step(sell_price, self.rules.tick_size);
 
         if buy_price >= book.ask {
-            buy_price = floor_to_step(
-                book.ask - self.rules.tick_size,
-                self.rules.tick_size,
-            );
+            buy_price = floor_to_step(book.ask - self.rules.tick_size, self.rules.tick_size);
         }
         if sell_price <= book.bid {
-            sell_price = ceil_to_step(
-                book.bid + self.rules.tick_size,
-                self.rules.tick_size,
-            );
+            sell_price = ceil_to_step(book.bid + self.rules.tick_size, self.rules.tick_size);
         }
 
         if self.rules.min_price > Decimal::ZERO {
@@ -510,10 +565,7 @@ impl MarketMaker {
             sell_price = sell_price.min(self.rules.max_price);
         }
 
-        if buy_price <= Decimal::ZERO
-            || sell_price <= Decimal::ZERO
-            || buy_price >= sell_price
-        {
+        if buy_price <= Decimal::ZERO || sell_price <= Decimal::ZERO || buy_price >= sell_price {
             bail!(
                 "computed invalid quote prices: buy={}, sell={}, best_bid={}, best_ask={}",
                 buy_price,
@@ -523,30 +575,17 @@ impl MarketMaker {
             );
         }
 
-        let max_position_qty =
-            self.config.max_position_notional_usd / mid;
-        let buy_capacity =
-            (max_position_qty - self.position.quantity).max(Decimal::ZERO);
-        let sell_capacity =
-            (max_position_qty + self.position.quantity).max(Decimal::ZERO);
+        let max_position_qty = self.config.max_position_notional_usd / mid;
+        let buy_capacity = (max_position_qty - self.position.quantity).max(Decimal::ZERO);
+        let sell_capacity = (max_position_qty + self.position.quantity).max(Decimal::ZERO);
 
-        let desired_buy_qty =
-            self.config.quote_notional_usd / buy_price;
-        let desired_sell_qty =
-            self.config.quote_notional_usd / sell_price;
+        let desired_buy_qty = self.config.quote_notional_usd / buy_price;
+        let desired_sell_qty = self.config.quote_notional_usd / sell_price;
 
-        let buy_quantity = normalize_quantity(
-            desired_buy_qty,
-            buy_capacity,
-            buy_price,
-            &self.rules,
-        );
-        let sell_quantity = normalize_quantity(
-            desired_sell_qty,
-            sell_capacity,
-            sell_price,
-            &self.rules,
-        );
+        let buy_quantity =
+            normalize_quantity(desired_buy_qty, buy_capacity, buy_price, &self.rules);
+        let sell_quantity =
+            normalize_quantity(desired_sell_qty, sell_capacity, sell_price, &self.rules);
 
         Ok((
             buy_quantity.map(|quantity| QuoteTarget {
@@ -560,52 +599,15 @@ impl MarketMaker {
         ))
     }
 
-    async fn manage_side(
-        &mut self,
-        side: OrderSide,
-        target: Option<QuoteTarget>,
-    ) -> Result<()> {
-        let existing = self.current_order(side).cloned();
-
-        match (existing, target) {
-            (None, None) => Ok(()),
-            (Some(existing), None) => {
-                self.take_current_order(side);
-                self.cancel_existing(&existing).await
-            }
-            (Some(existing), Some(target))
-                if !self.needs_requote(&existing, &target) =>
-            {
-                Ok(())
-            }
-            (Some(existing), Some(target)) => {
-                self.take_current_order(side);
-                self.cancel_existing(&existing).await?;
-                self.place_target(side, target).await
-            }
-            (None, Some(target)) => self.place_target(side, target).await,
-        }
-    }
-
-    fn needs_requote(
-        &self,
-        existing: &ManagedOrder,
-        target: &QuoteTarget,
-    ) -> bool {
-        let threshold = self.rules.tick_size
-            * Decimal::from(self.config.requote_threshold_ticks);
+    fn needs_requote(&self, existing: &ManagedOrder, target: &QuoteTarget) -> bool {
+        let threshold = self.rules.tick_size * Decimal::from(self.config.requote_threshold_ticks);
         (existing.price - target.price).abs() >= threshold
-            || (existing.quantity - target.quantity).abs()
-                >= self.rules.step_size
+            || (existing.quantity - target.quantity).abs() >= self.rules.step_size
             || existing.executed_qty > Decimal::ZERO
             || existing.status != "NEW"
     }
 
-    async fn place_target(
-        &mut self,
-        side: OrderSide,
-        target: QuoteTarget,
-    ) -> Result<()> {
+    async fn place_target(&mut self, side: OrderSide, target: QuoteTarget) -> Result<()> {
         let client_order_id = self.next_client_order_id(side);
         let notional = target.price * target.quantity;
 
@@ -627,8 +629,7 @@ impl MarketMaker {
                 notional = %notional,
                 "DRY RUN: placing GTX post-only order"
             );
-            self.stats.orders_placed =
-                self.stats.orders_placed.saturating_add(1);
+            self.stats.orders_placed = self.stats.orders_placed.saturating_add(1);
             self.stats.quoted_notional += notional;
             self.set_current_order(side, Some(order));
             return Ok(());
@@ -646,6 +647,7 @@ impl MarketMaker {
             .await
         {
             Ok(placed) => {
+                self.stats.managed_order_ids.insert(placed.order_id);
                 info!(
                     order_id = placed.order_id,
                     client_order_id = %placed.client_order_id,
@@ -656,13 +658,10 @@ impl MarketMaker {
                     status = %placed.status,
                     "placed GTX post-only order"
                 );
-                self.stats.orders_placed =
-                    self.stats.orders_placed.saturating_add(1);
+                self.stats.orders_placed = self.stats.orders_placed.saturating_add(1);
                 self.stats.quoted_notional += notional;
 
-                if placed.status == "NEW"
-                    || placed.status == "PARTIALLY_FILLED"
-                {
+                if placed.status == "NEW" || placed.status == "PARTIALLY_FILLED" {
                     self.set_current_order(
                         side,
                         Some(ManagedOrder {
@@ -694,13 +693,8 @@ impl MarketMaker {
                 Ok(())
             }
             Err(error) if error.is_execution_unknown() => {
-                self.recover_unknown_order(
-                    side,
-                    target,
-                    client_order_id,
-                    error,
-                )
-                .await
+                self.recover_unknown_order(side, target, client_order_id, error)
+                    .await
             }
             Err(error) => Err(error).context("failed to place order"),
         }
@@ -727,6 +721,7 @@ impl MarketMaker {
                 .await
             {
                 Ok(order) => {
+                    self.stats.managed_order_ids.insert(order.order_id);
                     info!(
                         attempt,
                         order_id = order.order_id,
@@ -734,17 +729,10 @@ impl MarketMaker {
                         "recovered order after unknown execution response"
                     );
 
-                    if order.status == "NEW"
-                        || order.status == "PARTIALLY_FILLED"
-                    {
-                        self.stats.orders_placed =
-                            self.stats.orders_placed.saturating_add(1);
-                        self.stats.quoted_notional +=
-                            target.price * target.quantity;
-                        self.set_current_order(
-                            side,
-                            Some(managed_from_open(order)),
-                        );
+                    if order.status == "NEW" || order.status == "PARTIALLY_FILLED" {
+                        self.stats.orders_placed = self.stats.orders_placed.saturating_add(1);
+                        self.stats.quoted_notional += target.price * target.quantity;
+                        self.set_current_order(side, Some(managed_from_open(order)));
                     }
                     return Ok(());
                 }
@@ -756,8 +744,7 @@ impl MarketMaker {
                     );
                 }
                 Err(error) => {
-                    return Err(error)
-                        .context("failed while recovering unknown order state");
+                    return Err(error).context("failed while recovering unknown order state");
                 }
             }
         }
@@ -768,10 +755,7 @@ impl MarketMaker {
         )
     }
 
-    async fn cancel_existing(
-        &mut self,
-        order: &ManagedOrder,
-    ) -> Result<()> {
+    async fn cancel_existing(&mut self, order: &ManagedOrder) -> Result<()> {
         if self.config.dry_run {
             info!(
                 order_id = order.order_id,
@@ -781,26 +765,21 @@ impl MarketMaker {
                 quantity = %order.quantity,
                 "DRY RUN: cancelling order"
             );
-            self.stats.orders_cancelled =
-                self.stats.orders_cancelled.saturating_add(1);
+            self.stats.orders_cancelled = self.stats.orders_cancelled.saturating_add(1);
             return Ok(());
         }
 
         self.cancel_by_client_id(&order.client_order_id).await
     }
 
-    async fn cancel_by_client_id(
-        &mut self,
-        client_order_id: &str,
-    ) -> Result<()> {
+    async fn cancel_by_client_id(&mut self, client_order_id: &str) -> Result<()> {
         match self
             .client
             .cancel_order(&self.config.symbol, client_order_id)
             .await
         {
             Ok(()) => {
-                self.stats.orders_cancelled =
-                    self.stats.orders_cancelled.saturating_add(1);
+                self.stats.orders_cancelled = self.stats.orders_cancelled.saturating_add(1);
                 info!(%client_order_id, "cancelled order");
                 Ok(())
             }
@@ -811,10 +790,98 @@ impl MarketMaker {
                 );
                 Ok(())
             }
-            Err(error) => {
-                Err(error).context("failed to cancel existing order")
+            Err(error) if error.is_execution_unknown() => {
+                self.recover_unknown_cancel(client_order_id, error).await
+            }
+            Err(error) => Err(error).context("failed to cancel existing order"),
+        }
+    }
+
+    async fn recover_unknown_cancel(
+        &mut self,
+        client_order_id: &str,
+        original_error: AsterError,
+    ) -> Result<()> {
+        warn!(
+            %original_error,
+            %client_order_id,
+            "cancel execution state is unknown; verifying order state before retrying"
+        );
+
+        for attempt in 1..=5 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match self
+                .client
+                .query_order(&self.config.symbol, client_order_id)
+                .await
+            {
+                Err(error) if error.is_no_such_order() => {
+                    info!(
+                        attempt,
+                        %client_order_id,
+                        "order is absent after unknown cancel response"
+                    );
+                    self.stats.orders_cancelled = self.stats.orders_cancelled.saturating_add(1);
+                    return Ok(());
+                }
+                Err(error) if error.is_rate_limited() => {
+                    warn!(attempt, %error, "rate limited while verifying cancellation");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(error) => {
+                    return Err(error).context("failed while verifying unknown cancel state");
+                }
+                Ok(order) if order.status != "NEW" && order.status != "PARTIALLY_FILLED" => {
+                    info!(
+                        attempt,
+                        order_id = order.order_id,
+                        status = %order.status,
+                        "order is no longer open after unknown cancel response"
+                    );
+                    return Ok(());
+                }
+                Ok(order) => {
+                    warn!(
+                        attempt,
+                        order_id = order.order_id,
+                        status = %order.status,
+                        "order remains open after unknown cancel response; retrying cancellation"
+                    );
+                    match self
+                        .client
+                        .cancel_order(&self.config.symbol, client_order_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            self.stats.orders_cancelled =
+                                self.stats.orders_cancelled.saturating_add(1);
+                            return Ok(());
+                        }
+                        Err(error) if error.is_no_such_order() => {
+                            self.stats.orders_cancelled =
+                                self.stats.orders_cancelled.saturating_add(1);
+                            return Ok(());
+                        }
+                        Err(error) if error.is_execution_unknown() => {
+                            warn!(attempt, %error, "retry cancel response is still unknown");
+                        }
+                        Err(error) if error.is_rate_limited() => {
+                            warn!(attempt, %error, "rate limited while retrying cancellation");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        Err(error) => {
+                            return Err(error)
+                                .context("failed while retrying unknown cancellation");
+                        }
+                    }
+                }
             }
         }
+
+        bail!(
+            "could not verify cancellation of order {} after an unknown execution response; halting with the exchange dead-man switch left armed when configured",
+            client_order_id
+        )
     }
 
     async fn cancel_managed_orders(&mut self) -> Result<()> {
@@ -823,6 +890,30 @@ impl MarketMaker {
         }
         if let Some(order) = self.sell_order.take() {
             self.cancel_existing(&order).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_no_existing_bot_orders(&self) -> Result<()> {
+        let orders = self
+            .client
+            .open_orders(&self.config.symbol)
+            .await
+            .context("failed to inspect existing bot orders")?;
+        let count = orders
+            .iter()
+            .filter(|order| {
+                order
+                    .client_order_id
+                    .starts_with(&self.config.client_order_prefix)
+            })
+            .count();
+        if count > 0 {
+            bail!(
+                "found {} existing order(s) with prefix {}; enable startup_cancel_existing_bot_orders or choose a fresh prefix",
+                count,
+                self.config.client_order_prefix
+            );
         }
         Ok(())
     }
@@ -877,12 +968,7 @@ impl MarketMaker {
         for _ in 0..10 {
             let result = self
                 .client
-                .user_trades(
-                    &self.config.symbol,
-                    start_time,
-                    from_id,
-                    1_000,
-                )
+                .user_trades(&self.config.symbol, start_time, from_id, 1_000)
                 .await;
 
             let fills = match result {
@@ -907,6 +993,9 @@ impl MarketMaker {
                         .unwrap_or(fill.id),
                 );
 
+                if !self.stats.managed_order_ids.contains(&fill.order_id) {
+                    continue;
+                }
                 if !self.stats.seen_trade_ids.insert(fill.id) {
                     continue;
                 }
@@ -939,8 +1028,7 @@ impl MarketMaker {
         let elapsed = self.stats.started_at.elapsed().as_secs_f64();
         let position_notional = self.position.quantity * mark_price;
         let maker_share = if self.stats.executed_notional > Decimal::ZERO {
-            (self.stats.maker_notional / self.stats.executed_notional)
-                * Decimal::from(100_u32)
+            (self.stats.maker_notional / self.stats.executed_notional) * Decimal::from(100_u32)
         } else {
             Decimal::ZERO
         };
@@ -968,22 +1056,28 @@ impl MarketMaker {
 
     async fn shutdown(&mut self) -> Result<()> {
         let mut errors = Vec::new();
+        let mut bot_orders_cleared = !self.config.cancel_on_exit;
 
         if self.config.cancel_on_exit {
-            if let Err(error) = self.cancel_all_orders_with_prefix().await {
-                errors.push(format!("failed to cancel bot orders: {error:#}"));
+            match self.cancel_all_orders_with_prefix().await {
+                Ok(()) => bot_orders_cleared = true,
+                Err(error) => {
+                    errors.push(format!("failed to cancel bot orders: {error:#}"));
+                }
             }
         }
 
         if self.config.deadman_switch_enabled && !self.config.dry_run {
-            if let Err(error) = self
-                .client
-                .countdown_cancel_all(&self.config.symbol, 0)
-                .await
-            {
-                errors.push(format!(
-                    "failed to disarm dead-man switch: {error}"
-                ));
+            if bot_orders_cleared {
+                if let Err(error) = self
+                    .client
+                    .countdown_cancel_all(&self.config.symbol, 0)
+                    .await
+                {
+                    errors.push(format!("failed to disarm dead-man switch: {error}"));
+                }
+            } else {
+                warn!("bot-order cleanup failed; leaving the exchange dead-man switch armed");
             }
         }
 
@@ -1015,21 +1109,14 @@ impl MarketMaker {
         }
     }
 
-    fn take_current_order(
-        &mut self,
-        side: OrderSide,
-    ) -> Option<ManagedOrder> {
+    fn take_current_order(&mut self, side: OrderSide) -> Option<ManagedOrder> {
         match side {
             OrderSide::Buy => self.buy_order.take(),
             OrderSide::Sell => self.sell_order.take(),
         }
     }
 
-    fn set_current_order(
-        &mut self,
-        side: OrderSide,
-        order: Option<ManagedOrder>,
-    ) {
+    fn set_current_order(&mut self, side: OrderSide, order: Option<ManagedOrder>) {
         match side {
             OrderSide::Buy => self.buy_order = order,
             OrderSide::Sell => self.sell_order = order,
@@ -1055,18 +1142,12 @@ fn normalize_quantity(
     price: Decimal,
     rules: &SymbolRules,
 ) -> Option<Decimal> {
-    if desired <= Decimal::ZERO
-        || capacity <= Decimal::ZERO
-        || price <= Decimal::ZERO
-    {
+    if desired <= Decimal::ZERO || capacity <= Decimal::ZERO || price <= Decimal::ZERO {
         return None;
     }
 
     let minimum_for_notional = if rules.min_notional > Decimal::ZERO {
-        ceil_to_step(
-            rules.min_notional / price,
-            rules.step_size,
-        )
+        ceil_to_step(rules.min_notional / price, rules.step_size)
     } else {
         Decimal::ZERO
     };
@@ -1076,10 +1157,7 @@ fn normalize_quantity(
     let capacity = floor_to_step(capacity, rules.step_size);
     let quantity = desired.min(capacity).min(rules.max_qty);
 
-    if quantity < required
-        || quantity <= Decimal::ZERO
-        || quantity * price < rules.min_notional
-    {
+    if quantity < required || quantity <= Decimal::ZERO || quantity * price < rules.min_notional {
         None
     } else {
         Some(quantity)

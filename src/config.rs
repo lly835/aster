@@ -1,6 +1,7 @@
 use std::{env, fs, path::Path, str::FromStr};
 
 use anyhow::{bail, Context, Result};
+use reqwest::Url;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
@@ -148,18 +149,12 @@ pub fn load(path: &Path) -> Result<RuntimeConfig> {
     let file: FileConfig =
         toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
 
-    let quote_notional_usd = parse_positive_decimal(
-        "quote_notional_usd",
-        &file.quote_notional_usd,
-    )?;
-    let max_position_notional_usd = parse_positive_decimal(
-        "max_position_notional_usd",
-        &file.max_position_notional_usd,
-    )?;
-    let max_unrealized_loss_usd = parse_positive_decimal(
-        "max_unrealized_loss_usd",
-        &file.max_unrealized_loss_usd,
-    )?;
+    let quote_notional_usd =
+        parse_positive_decimal("quote_notional_usd", &file.quote_notional_usd)?;
+    let max_position_notional_usd =
+        parse_positive_decimal("max_position_notional_usd", &file.max_position_notional_usd)?;
+    let max_unrealized_loss_usd =
+        parse_positive_decimal("max_unrealized_loss_usd", &file.max_unrealized_loss_usd)?;
 
     if file.symbol.trim().is_empty() {
         bail!("symbol cannot be empty");
@@ -180,9 +175,7 @@ pub fn load(path: &Path) -> Result<RuntimeConfig> {
         bail!("requote_threshold_ticks must be at least 1");
     }
     if max_position_notional_usd < quote_notional_usd {
-        bail!(
-            "max_position_notional_usd must be at least quote_notional_usd"
-        );
+        bail!("max_position_notional_usd must be at least quote_notional_usd");
     }
 
     validate_client_order_prefix(&file.client_order_prefix)?;
@@ -198,15 +191,20 @@ pub fn load(path: &Path) -> Result<RuntimeConfig> {
         if file.dry_run {
             bail!("deadman_switch_enabled has no effect in dry-run mode; disable it");
         }
+        if !file.cancel_on_exit {
+            bail!("deadman_switch_enabled requires cancel_on_exit = true");
+        }
         if file.deadman_countdown_ms < 10_000 {
             bail!("deadman_countdown_ms must be at least 10000");
         }
-        if file.deadman_heartbeat_ms == 0
-            || file.deadman_heartbeat_ms >= file.deadman_countdown_ms
+        if file.deadman_heartbeat_ms == 0 || file.deadman_heartbeat_ms >= file.deadman_countdown_ms
         {
             bail!(
                 "deadman_heartbeat_ms must be greater than zero and smaller than deadman_countdown_ms"
             );
+        }
+        if file.deadman_countdown_ms < file.deadman_heartbeat_ms.saturating_mul(2) {
+            bail!("deadman_countdown_ms must be at least twice deadman_heartbeat_ms");
         }
     }
 
@@ -220,6 +218,9 @@ pub fn load(path: &Path) -> Result<RuntimeConfig> {
         .unwrap_or_else(|| file.environment.default_ws_url().to_owned())
         .trim_end_matches('/')
         .to_owned();
+
+    validate_base_url("rest_base_url", &rest_base_url, "https")?;
+    validate_base_url("ws_base_url", &ws_base_url, "wss")?;
 
     Ok(RuntimeConfig {
         environment: file.environment,
@@ -258,7 +259,9 @@ pub fn credentials_from_env() -> Result<Option<Credentials>> {
     let private_key = env::var("ASTER_SIGNER_PRIVATE_KEY").ok();
 
     let supplied = [
-        user.as_ref().map(|value| !value.trim().is_empty()).unwrap_or(false),
+        user.as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
         signer
             .as_ref()
             .map(|value| !value.trim().is_empty())
@@ -285,9 +288,29 @@ pub fn credentials_from_env() -> Result<Option<Credentials>> {
     }))
 }
 
+fn validate_base_url(name: &str, raw: &str, expected_scheme: &str) -> Result<()> {
+    let url = Url::parse(raw).with_context(|| format!("{name} must be a valid URL"))?;
+    if url.scheme() != expected_scheme {
+        bail!("{name} must use the {expected_scheme} scheme");
+    }
+    if url.host_str().is_none() {
+        bail!("{name} must include a host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("{name} must not contain embedded credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("{name} must not contain a query string or fragment");
+    }
+    if url.path() != "/" {
+        bail!("{name} must not contain a path");
+    }
+    Ok(())
+}
+
 fn parse_positive_decimal(name: &str, value: &str) -> Result<Decimal> {
-    let parsed = Decimal::from_str(value)
-        .with_context(|| format!("{name} must be a decimal string"))?;
+    let parsed =
+        Decimal::from_str(value).with_context(|| format!("{name} must be a decimal string"))?;
     if parsed <= Decimal::ZERO {
         bail!("{name} must be greater than zero");
     }
@@ -302,16 +325,14 @@ fn validate_client_order_prefix(prefix: &str) -> Result<()> {
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
-        bail!(
-            "client_order_prefix may contain only ASCII letters, digits, '_' and '-'"
-        );
+        bail!("client_order_prefix may contain only ASCII letters, digits, '_' and '-'");
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_client_order_prefix;
+    use super::{validate_base_url, validate_client_order_prefix};
 
     #[test]
     fn validates_client_order_prefix() {
@@ -319,5 +340,14 @@ mod tests {
         assert!(validate_client_order_prefix("").is_err());
         assert!(validate_client_order_prefix("bad prefix").is_err());
         assert!(validate_client_order_prefix("1234567890123").is_err());
+    }
+
+    #[test]
+    fn validates_base_urls() {
+        assert!(validate_base_url("rest", "https://fapi.asterdex.com", "https").is_ok());
+        assert!(validate_base_url("ws", "wss://fstream.asterdex.com", "wss").is_ok());
+        assert!(validate_base_url("rest", "http://localhost", "https").is_err());
+        assert!(validate_base_url("rest", "https://example.com/path", "https").is_err());
+        assert!(validate_base_url("ws", "wss://user:pass@example.com", "wss").is_err());
     }
 }
