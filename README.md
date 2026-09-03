@@ -241,12 +241,14 @@ As long inventory grows, both quotes move downward. As short inventory grows, bo
 
 ### Maker-first IOC inventory rebalancing
 
-When enabled, the normal path remains post-only Maker quoting. A Taker order is used only to reduce an existing net position when either:
+When explicitly enabled, the normal path remains post-only Maker quoting. The internal compatibility default is disabled, so an older `config.toml` that omits these fields will not silently begin sending Taker orders after an upgrade. The checked-in example opts in visibly. A Taker order is used only to reduce an existing net position when either:
 
 - absolute position notional reaches `taker_rebalance_trigger_notional_usd`; or
 - the position stays above `taker_rebalance_target_notional_usd` for `taker_rebalance_max_position_age_secs`.
 
 Before the aggressive order, the bot cancels its tracked Maker quotes and refreshes the position. It then submits one opposite-side `LIMIT + IOC` order with `reduceOnly=true`. The order quantity moves the position toward the configured target, is capped by `taker_rebalance_max_order_notional_usd`, and can never intentionally increase or reverse exposure. `taker_rebalance_max_slippage_bps` bounds the worst acceptable limit price, while `taker_rebalance_cooldown_secs` prevents repeated aggressive orders in a tight loop.
+
+If inventory still requires rebalancing during the configured cooldown, the bot pauses Maker quoting instead of reopening both sides and potentially increasing exposure.
 
 This is inventory-risk control, not a target-volume or target-Maker/Taker-ratio engine. It may produce no Taker volume when inventory is naturally balanced, and it does not guarantee campaign points, the screenshot's 83.8%/16.2% split, or profitability.
 

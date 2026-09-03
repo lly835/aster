@@ -365,7 +365,7 @@ impl MarketMaker {
             .position(&self.config.symbol, fallback_mark)
             .await
             .context("failed to refresh position after order-state change")?;
-        self.observe_inventory(position.quantity);
+        self.observe_inventory(position.quantity, position.mark_price);
         self.position = position;
         Ok(())
     }
@@ -454,11 +454,14 @@ impl MarketMaker {
         Ok(position_may_have_changed)
     }
 
-    fn observe_inventory(&mut self, quantity: Decimal) {
+    fn observe_inventory(&mut self, quantity: Decimal, mark_price: Decimal) {
         let direction = position_direction(quantity);
-        if direction == 0 {
+        let at_or_below_target =
+            quantity.abs() * mark_price <= self.config.taker_rebalance_target_notional_usd;
+
+        if direction == 0 || at_or_below_target {
             self.inventory_since = None;
-            self.inventory_direction = 0;
+            self.inventory_direction = direction;
         } else if direction != self.inventory_direction || self.inventory_since.is_none() {
             self.inventory_since = Some(Instant::now());
             self.inventory_direction = direction;
@@ -499,7 +502,14 @@ impl MarketMaker {
             return Ok(false);
         };
         if self.taker_rebalance_in_cooldown() {
-            return Ok(false);
+            if self.buy_order.is_some() || self.sell_order.is_some() {
+                warn!(
+                    position_qty = %self.position.quantity,
+                    "inventory still requires rebalancing during cooldown; cancelling maker quotes and pausing new quotes"
+                );
+                self.cancel_managed_orders().await?;
+            }
+            return Ok(true);
         }
 
         self.last_taker_rebalance = Some(Instant::now());

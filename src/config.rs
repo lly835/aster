@@ -90,7 +90,7 @@ impl Default for FileConfig {
             max_position_notional_usd: "50".to_owned(),
             max_unrealized_loss_usd: "5".to_owned(),
 
-            taker_rebalance_enabled: true,
+            taker_rebalance_enabled: false,
             taker_rebalance_trigger_notional_usd: "30".to_owned(),
             taker_rebalance_target_notional_usd: "5".to_owned(),
             taker_rebalance_max_order_notional_usd: "20".to_owned(),
@@ -410,6 +410,11 @@ fn validate_client_order_prefix(prefix: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{validate_base_url, validate_client_order_prefix};
+
+    #[test]
+    fn taker_rebalancing_is_disabled_when_omitted() {
+        assert!(!super::FileConfig::default().taker_rebalance_enabled);
+    }
 
     #[test]
     fn validates_client_order_prefix() {
