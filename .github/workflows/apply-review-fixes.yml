@@ -42,6 +42,29 @@ jobs:
           PY
       - name: Apply reviewed changes
         run: python3 scripts/apply_review_fixes.py
+      - name: Preserve quote target computation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          original = subprocess.check_output(
+              ["git", "show", "HEAD:src/bot.rs"],
+              text=True,
+          )
+          start = original.index("    fn compute_targets(")
+          end = original.index("    async fn manage_side(", start)
+          method = original[start:end]
+
+          path = Path("src/bot.rs")
+          content = path.read_text(encoding="utf-8")
+          if "    fn compute_targets(" not in content:
+              marker = "    fn needs_requote("
+              if content.count(marker) != 1:
+                  raise SystemExit("unexpected quote-engine layout")
+              content = content.replace(marker, method + marker, 1)
+              path.write_text(content, encoding="utf-8")
+          PY
       - name: Use current stable Rust policy
         run: |
           python3 - <<'PY'
