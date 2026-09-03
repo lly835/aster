@@ -74,11 +74,6 @@ jobs:
           cargo = manifest.read_text(encoding="utf-8")
           cargo = cargo.replace('rust-version = "1.82"\n', '', 1)
           manifest.write_text(cargo, encoding="utf-8")
-
-          workflow = Path(".github/workflows/ci.yml")
-          ci = workflow.read_text(encoding="utf-8")
-          ci = ci.replace("dtolnay/rust-toolchain@1.82.0", "dtolnay/rust-toolchain@stable")
-          workflow.write_text(ci, encoding="utf-8")
           PY
       - name: Generate dependency lockfile
         run: cargo generate-lockfile
@@ -90,10 +85,12 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked --all-targets
-      - name: Commit reviewed changes
+      - name: Commit reviewed source changes
         run: |
-          rm -f scripts/apply_review_fixes.py .github/workflows/apply-review-fixes.yml
-          rmdir scripts 2>/dev/null || true
+          git restore --source=HEAD -- \
+            .github/workflows/ci.yml \
+            .github/workflows/apply-review-fixes.yml \
+            scripts/apply_review_fixes.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
