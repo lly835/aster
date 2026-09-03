@@ -32,6 +32,21 @@ struct ManagedOrder {
     status: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RebalanceReason {
+    NotionalThreshold,
+    PositionAge,
+}
+
+impl RebalanceReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotionalThreshold => "notional_threshold",
+            Self::PositionAge => "position_age",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SessionStats {
     started_at: Instant,
@@ -45,6 +60,8 @@ struct SessionStats {
     taker_notional: Decimal,
     commission_abs: Decimal,
     realized_pnl: Decimal,
+    taker_rebalance_attempts: u64,
+    taker_rebalance_requested_notional: Decimal,
     managed_order_ids: HashSet<u64>,
     seen_trade_ids: HashSet<u64>,
     last_trade_id: Option<u64>,
@@ -64,6 +81,8 @@ impl SessionStats {
             taker_notional: Decimal::ZERO,
             commission_abs: Decimal::ZERO,
             realized_pnl: Decimal::ZERO,
+            taker_rebalance_attempts: 0,
+            taker_rebalance_requested_notional: Decimal::ZERO,
             managed_order_ids: HashSet::new(),
             seen_trade_ids: HashSet::new(),
             last_trade_id: None,
@@ -84,6 +103,9 @@ pub struct MarketMaker {
     stats: SessionStats,
     id_sequence: u64,
     stale_orders_cancelled: bool,
+    inventory_since: Option<Instant>,
+    inventory_direction: i8,
+    last_taker_rebalance: Option<Instant>,
 }
 
 impl MarketMaker {
@@ -106,6 +128,9 @@ impl MarketMaker {
             stats: SessionStats::new(),
             id_sequence: 0,
             stale_orders_cancelled: false,
+            inventory_since: None,
+            inventory_direction: 0,
+            last_taker_rebalance: None,
         }
     }
 
@@ -193,7 +218,10 @@ impl MarketMaker {
                     }
 
                     self.enforce_risk_limits(mid)?;
-                    self.quote_once(&book).await?;
+                    let rebalanced = self.maybe_rebalance_inventory(&book).await?;
+                    if !rebalanced {
+                        self.quote_once(&book).await?;
+                    }
 
                     if !self.config.dry_run
                         && last_stats_refresh.elapsed()
@@ -256,6 +284,9 @@ impl MarketMaker {
             dry_run = self.config.dry_run,
             quote_notional = %self.config.quote_notional_usd,
             max_position_notional = %self.config.max_position_notional_usd,
+            taker_rebalance_enabled = self.config.taker_rebalance_enabled,
+            taker_rebalance_trigger_notional = %self.config.taker_rebalance_trigger_notional_usd,
+            taker_rebalance_target_notional = %self.config.taker_rebalance_target_notional_usd,
             tick_size = %self.rules.tick_size,
             step_size = %self.rules.step_size,
             min_notional = %self.rules.min_notional,
@@ -329,11 +360,13 @@ impl MarketMaker {
     }
 
     async fn refresh_position_only(&mut self, fallback_mark: Decimal) -> Result<()> {
-        self.position = self
+        let position = self
             .client
             .position(&self.config.symbol, fallback_mark)
             .await
             .context("failed to refresh position after order-state change")?;
+        self.observe_inventory(position.quantity, position.mark_price);
+        self.position = position;
         Ok(())
     }
 
@@ -419,6 +452,240 @@ impl MarketMaker {
         }
 
         Ok(position_may_have_changed)
+    }
+
+    fn observe_inventory(&mut self, quantity: Decimal, mark_price: Decimal) {
+        let direction = position_direction(quantity);
+        let at_or_below_target =
+            quantity.abs() * mark_price <= self.config.taker_rebalance_target_notional_usd;
+
+        if direction == 0 || at_or_below_target {
+            self.inventory_since = None;
+            self.inventory_direction = direction;
+        } else if direction != self.inventory_direction || self.inventory_since.is_none() {
+            self.inventory_since = Some(Instant::now());
+            self.inventory_direction = direction;
+        }
+    }
+
+    fn rebalance_reason(&self, mark_price: Decimal) -> Option<RebalanceReason> {
+        if !self.config.taker_rebalance_enabled || self.position.quantity == Decimal::ZERO {
+            return None;
+        }
+
+        let position_notional = self.position.quantity.abs() * mark_price;
+        if position_notional <= self.config.taker_rebalance_target_notional_usd {
+            return None;
+        }
+        if position_notional >= self.config.taker_rebalance_trigger_notional_usd {
+            return Some(RebalanceReason::NotionalThreshold);
+        }
+
+        let age = self.inventory_since?.elapsed();
+        if age >= Duration::from_secs(self.config.taker_rebalance_max_position_age_secs) {
+            return Some(RebalanceReason::PositionAge);
+        }
+        None
+    }
+
+    fn taker_rebalance_in_cooldown(&self) -> bool {
+        self.last_taker_rebalance
+            .map(|last| {
+                last.elapsed() < Duration::from_secs(self.config.taker_rebalance_cooldown_secs)
+            })
+            .unwrap_or(false)
+    }
+
+    async fn maybe_rebalance_inventory(&mut self, book: &Book) -> Result<bool> {
+        let mid = (book.bid + book.ask) / Decimal::from(2_u32);
+        let Some(initial_reason) = self.rebalance_reason(mid) else {
+            return Ok(false);
+        };
+        if self.taker_rebalance_in_cooldown() {
+            if self.buy_order.is_some() || self.sell_order.is_some() {
+                warn!(
+                    position_qty = %self.position.quantity,
+                    "inventory still requires rebalancing during cooldown; cancelling maker quotes and pausing new quotes"
+                );
+                self.cancel_managed_orders().await?;
+            }
+            return Ok(true);
+        }
+
+        self.last_taker_rebalance = Some(Instant::now());
+        warn!(
+            reason = initial_reason.as_str(),
+            position_qty = %self.position.quantity,
+            position_notional = %(self.position.quantity.abs() * mid),
+            "inventory rebalance trigger reached; cancelling maker quotes before reduce-only IOC"
+        );
+
+        self.cancel_managed_orders().await?;
+        if !self.config.dry_run {
+            self.refresh_position_only(mid).await?;
+        }
+
+        let Some(reason) = self.rebalance_reason(mid) else {
+            info!("inventory changed while maker orders were being cancelled; IOC rebalance is no longer needed");
+            return Ok(true);
+        };
+
+        let side = if self.position.quantity > Decimal::ZERO {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        };
+        let Some(quantity) = compute_rebalance_quantity(
+            self.position.quantity,
+            mid,
+            self.config.taker_rebalance_target_notional_usd,
+            self.config.taker_rebalance_max_order_notional_usd,
+            &self.rules,
+        ) else {
+            warn!(
+                position_qty = %self.position.quantity,
+                min_qty = %self.rules.min_qty,
+                "inventory exceeds the configured target but is too small for a valid reduce-only order"
+            );
+            return Ok(true);
+        };
+        let price = aggressive_ioc_price(
+            side,
+            book,
+            self.config.taker_rebalance_max_slippage_bps,
+            &self.rules,
+        )
+        .ok_or_else(|| anyhow!("could not compute a valid price-protected IOC limit"))?;
+        let client_order_id = self.next_client_order_id(side);
+        let requested_notional = quantity * mid;
+
+        self.stats.taker_rebalance_attempts = self.stats.taker_rebalance_attempts.saturating_add(1);
+        self.stats.taker_rebalance_requested_notional += requested_notional;
+
+        if self.config.dry_run {
+            info!(
+                reason = reason.as_str(),
+                side = side.as_str(),
+                price = %price,
+                quantity = %quantity,
+                requested_notional = %requested_notional,
+                reduce_only = true,
+                time_in_force = "IOC",
+                "DRY RUN: inventory would be reduced with a price-protected IOC limit"
+            );
+            return Ok(true);
+        }
+
+        match self
+            .client
+            .place_reduce_only_ioc_limit(
+                &self.config.symbol,
+                side,
+                quantity,
+                price,
+                &client_order_id,
+            )
+            .await
+        {
+            Ok(placed) => {
+                self.stats.managed_order_ids.insert(placed.order_id);
+                self.stats.orders_placed = self.stats.orders_placed.saturating_add(1);
+                info!(
+                    reason = reason.as_str(),
+                    order_id = placed.order_id,
+                    client_order_id = %placed.client_order_id,
+                    side = side.as_str(),
+                    limit_price = %price,
+                    quantity = %quantity,
+                    executed_qty = %placed.executed_qty,
+                    avg_price = %placed.avg_price,
+                    status = %placed.status,
+                    "submitted reduce-only IOC inventory rebalance"
+                );
+
+                if placed.status == "NEW" || placed.status == "PARTIALLY_FILLED" {
+                    warn!(
+                        order_id = placed.order_id,
+                        status = %placed.status,
+                        "IOC response was not final; cancelling any possible remainder"
+                    );
+                    self.cancel_by_client_id(&placed.client_order_id).await?;
+                }
+                self.refresh_position_only(mid).await?;
+                Ok(true)
+            }
+            Err(error) if error.is_transient_rejection() => {
+                warn!(%error, "reduce-only IOC was rejected; retaining the current position");
+                self.refresh_position_only(mid).await?;
+                Ok(true)
+            }
+            Err(error) if error.is_rate_limited() => {
+                warn!(%error, "rate limited while submitting reduce-only IOC; pausing for one second");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                self.refresh_position_only(mid).await?;
+                Ok(true)
+            }
+            Err(error) if error.is_execution_unknown() => {
+                self.recover_unknown_rebalance(&client_order_id, mid, error)
+                    .await?;
+                Ok(true)
+            }
+            Err(error) => Err(error).context("failed to submit reduce-only IOC rebalance"),
+        }
+    }
+
+    async fn recover_unknown_rebalance(
+        &mut self,
+        client_order_id: &str,
+        fallback_mark: Decimal,
+        original_error: AsterError,
+    ) -> Result<()> {
+        warn!(
+            %original_error,
+            %client_order_id,
+            "IOC execution state is unknown; querying by client order ID"
+        );
+
+        for attempt in 1..=5 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match self
+                .client
+                .query_order(&self.config.symbol, client_order_id)
+                .await
+            {
+                Ok(order) => {
+                    self.stats.managed_order_ids.insert(order.order_id);
+                    self.stats.orders_placed = self.stats.orders_placed.saturating_add(1);
+                    info!(
+                        attempt,
+                        order_id = order.order_id,
+                        status = %order.status,
+                        executed_qty = %order.executed_qty,
+                        "recovered reduce-only IOC after unknown execution response"
+                    );
+                    if order.status == "NEW" || order.status == "PARTIALLY_FILLED" {
+                        self.cancel_by_client_id(client_order_id).await?;
+                    }
+                    self.refresh_position_only(fallback_mark).await?;
+                    return Ok(());
+                }
+                Err(error) if error.is_no_such_order() => {
+                    warn!(attempt, %client_order_id, "IOC order is not visible yet");
+                }
+                Err(error) if error.is_rate_limited() => {
+                    warn!(attempt, %error, "rate limited while recovering IOC state");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(error) => {
+                    return Err(error).context("failed while recovering IOC execution state");
+                }
+            }
+        }
+
+        bail!(
+            "could not determine whether reduce-only IOC order {} executed; halting instead of risking another aggressive order",
+            client_order_id
+        )
     }
 
     fn enforce_risk_limits(&self, mark_price: Decimal) -> Result<()> {
@@ -1031,6 +1298,10 @@ impl MarketMaker {
     fn log_stats(&self, mark_price: Decimal) {
         let elapsed = self.stats.started_at.elapsed().as_secs_f64();
         let position_notional = self.position.quantity * mark_price;
+        let inventory_age_seconds = self
+            .inventory_since
+            .map(|started| started.elapsed().as_secs())
+            .unwrap_or(0);
         let maker_share = if self.stats.executed_notional > Decimal::ZERO {
             (self.stats.maker_notional / self.stats.executed_notional) * Decimal::from(100_u32)
         } else {
@@ -1049,7 +1320,10 @@ impl MarketMaker {
             maker_share_percent = %maker_share.round_dp(2),
             commission_abs = %self.stats.commission_abs,
             realized_pnl = %self.stats.realized_pnl,
+            taker_rebalance_attempts = self.stats.taker_rebalance_attempts,
+            taker_rebalance_requested_notional = %self.stats.taker_rebalance_requested_notional,
             position_qty = %self.position.quantity,
+            inventory_age_seconds,
             position_notional = %position_notional,
             entry_price = %self.position.entry_price,
             mark_price = %self.position.mark_price,
@@ -1147,6 +1421,75 @@ fn managed_from_open(order: OpenOrder) -> ManagedOrder {
     }
 }
 
+fn position_direction(quantity: Decimal) -> i8 {
+    if quantity > Decimal::ZERO {
+        1
+    } else if quantity < Decimal::ZERO {
+        -1
+    } else {
+        0
+    }
+}
+
+fn compute_rebalance_quantity(
+    position_quantity: Decimal,
+    mark_price: Decimal,
+    target_notional: Decimal,
+    max_order_notional: Decimal,
+    rules: &SymbolRules,
+) -> Option<Decimal> {
+    if position_quantity == Decimal::ZERO
+        || mark_price <= Decimal::ZERO
+        || max_order_notional <= Decimal::ZERO
+    {
+        return None;
+    }
+
+    let absolute_position = position_quantity.abs();
+    let target_quantity = target_notional / mark_price;
+    let excess_quantity = (absolute_position - target_quantity).max(Decimal::ZERO);
+    let max_order_quantity = max_order_notional / mark_price;
+    let quantity = floor_to_step(
+        excess_quantity
+            .min(max_order_quantity)
+            .min(absolute_position)
+            .min(rules.max_qty),
+        rules.step_size,
+    );
+
+    if quantity < rules.min_qty || quantity <= Decimal::ZERO {
+        None
+    } else {
+        Some(quantity)
+    }
+}
+
+fn aggressive_ioc_price(
+    side: OrderSide,
+    book: &Book,
+    max_slippage_bps: u64,
+    rules: &SymbolRules,
+) -> Option<Decimal> {
+    let slippage = Decimal::from(max_slippage_bps) / Decimal::from(10_000_u32);
+    let mut price = match side {
+        OrderSide::Buy => ceil_to_step(book.ask * (Decimal::ONE + slippage), rules.tick_size),
+        OrderSide::Sell => floor_to_step(book.bid * (Decimal::ONE - slippage), rules.tick_size),
+    };
+
+    if rules.min_price > Decimal::ZERO {
+        price = price.max(rules.min_price);
+    }
+    if rules.max_price > Decimal::ZERO {
+        price = price.min(rules.max_price);
+    }
+
+    if price <= Decimal::ZERO {
+        None
+    } else {
+        Some(price)
+    }
+}
+
 fn normalize_quantity(
     desired: Decimal,
     capacity: Decimal,
@@ -1201,8 +1544,13 @@ fn unix_millis_u64() -> u64 {
 mod tests {
     use rust_decimal::Decimal;
 
-    use super::{ceil_to_step, floor_to_step, normalize_quantity};
-    use crate::api::SymbolRules;
+    use std::time::Instant;
+
+    use super::{
+        aggressive_ioc_price, ceil_to_step, compute_rebalance_quantity, floor_to_step,
+        normalize_quantity,
+    };
+    use crate::api::{Book, OrderSide, SymbolRules};
 
     fn rules() -> SymbolRules {
         SymbolRules {
@@ -1240,6 +1588,34 @@ mod tests {
         )
         .expect("quantity");
         assert_eq!(result, Decimal::new(5, 2));
+    }
+
+    #[test]
+    fn rebalance_quantity_moves_toward_target_and_respects_order_cap() {
+        let quantity = compute_rebalance_quantity(
+            Decimal::new(500, 3),
+            Decimal::new(100, 0),
+            Decimal::new(10, 0),
+            Decimal::new(20, 0),
+            &rules(),
+        )
+        .expect("rebalance quantity");
+        assert_eq!(quantity, Decimal::new(200, 3));
+    }
+
+    #[test]
+    fn aggressive_ioc_price_is_bounded_by_configured_slippage() {
+        let book = Book {
+            bid: Decimal::new(10_000, 2),
+            ask: Decimal::new(10_010, 2),
+            received_at: Instant::now(),
+        };
+        let sell = aggressive_ioc_price(OrderSide::Sell, &book, 5, &rules()).expect("sell price");
+        let buy = aggressive_ioc_price(OrderSide::Buy, &book, 5, &rules()).expect("buy price");
+        assert!(sell <= book.bid);
+        assert!(sell >= Decimal::new(9_995, 2));
+        assert!(buy >= book.ask);
+        assert!(buy <= Decimal::new(10_016, 2));
     }
 
     #[test]
